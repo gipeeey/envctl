@@ -1,0 +1,18 @@
+[package]
+name = "envctl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+age = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+dirs = "5"
+walkdir = "2"
+similar = "2"
+tempfile = "3"
+indexmap = { version = "2", features = ["serde"] }
+ratatui = "0.29"
+crossterm = "0.28"
