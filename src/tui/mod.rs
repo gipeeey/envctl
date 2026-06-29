@@ -2,7 +2,7 @@ use std::{collections::HashMap, io, path::PathBuf, time::{Duration, Instant}};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -21,6 +21,13 @@ use crate::{
     env_file,
     store::{Store, registry::Registry},
 };
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Bundle {
+    registry: Registry,
+    #[serde(default)]
+    vars: IndexMap<String, IndexMap<String, String>>,
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
@@ -101,16 +108,119 @@ impl VarForm {
     }
 }
 
+struct FileEntry {
+    name: String,
+    is_parent: bool,
+    is_dir: bool,
+}
+
+struct FileBrowser {
+    cwd: PathBuf,
+    entries: Vec<FileEntry>,
+    state: ListState,
+    show_files: bool,
+}
+
+impl FileBrowser {
+    fn new(start: PathBuf) -> Self {
+        Self::new_with(start, false)
+    }
+
+    fn new_with(start: PathBuf, show_files: bool) -> Self {
+        let mut fb = Self { cwd: start, entries: Vec::new(), state: ListState::default(), show_files };
+        fb.reload();
+        fb
+    }
+
+    fn reload(&mut self) {
+        let mut entries = Vec::new();
+        if self.cwd.parent().is_some() {
+            entries.push(FileEntry { name: "..".into(), is_parent: true, is_dir: true });
+        }
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            let mut dirs: Vec<String> = Vec::new();
+            let mut files: Vec<String> = Vec::new();
+            for e in rd.filter_map(|e| e.ok()) {
+                let is_dir = e.path().is_dir();
+                if !is_dir && !self.show_files {
+                    continue;
+                }
+                if let Ok(name) = e.file_name().into_string() {
+                    if is_dir { dirs.push(name) } else { files.push(name) }
+                }
+            }
+            dirs.sort();
+            files.sort();
+            entries.extend(dirs.into_iter().map(|name| FileEntry { name, is_parent: false, is_dir: true }));
+            entries.extend(files.into_iter().map(|name| FileEntry { name, is_parent: false, is_dir: false }));
+        }
+        self.entries = entries;
+        self.state.select(if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.state.selected().unwrap_or(0).min(self.entries.len() - 1))
+        });
+    }
+
+    fn move_up(&mut self) {
+        if let Some(cur) = self.state.selected() {
+            self.state.select(Some(cur.saturating_sub(1)));
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let cur = self.state.selected().unwrap_or(0);
+        self.state.select(Some((cur + 1).min(self.entries.len() - 1)));
+    }
+
+    /// Navigates into the selected directory. No-op if the selection is a file.
+    fn enter_selected(&mut self) {
+        if let Some(e) = self.state.selected().and_then(|i| self.entries.get(i)) {
+            if !e.is_dir {
+                return;
+            }
+            if e.is_parent {
+                if let Some(parent) = self.cwd.parent() {
+                    self.cwd = parent.to_path_buf();
+                }
+            } else {
+                self.cwd.push(&e.name);
+            }
+            self.reload();
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(parent) = self.cwd.parent() {
+            self.cwd = parent.to_path_buf();
+            self.reload();
+        }
+    }
+
+    fn selected_file_path(&self) -> Option<PathBuf> {
+        let e = self.state.selected().and_then(|i| self.entries.get(i))?;
+        if e.is_dir { None } else { Some(self.cwd.join(&e.name)) }
+    }
+}
+
+fn default_browse_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
+
 struct RepoForm {
     name: String,
     path: String,
     focus: RepoFormField,
     editing: Option<String>,
+    browser: Option<FileBrowser>,
 }
 
 impl RepoForm {
     fn new() -> Self {
-        Self { name: String::new(), path: String::new(), focus: RepoFormField::Name, editing: None }
+        Self { name: String::new(), path: String::new(), focus: RepoFormField::Name, editing: None, browser: None }
     }
 
     fn edit(name: &str, path: &str) -> Self {
@@ -119,6 +229,36 @@ impl RepoForm {
             path: path.to_string(),
             focus: RepoFormField::Path,
             editing: Some(name.to_string()),
+            browser: None,
+        }
+    }
+
+    fn browse_start_dir(&self) -> PathBuf {
+        let p = PathBuf::from(&self.path);
+        if p.is_dir() {
+            p
+        } else {
+            p.parent().filter(|d| d.is_dir()).map(|d| d.to_path_buf()).unwrap_or_else(default_browse_dir)
+        }
+    }
+}
+
+struct PathForm {
+    path: String,
+    browser: Option<FileBrowser>,
+}
+
+impl PathForm {
+    fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into(), browser: None }
+    }
+
+    fn browse_start_dir(&self) -> PathBuf {
+        let p = PathBuf::from(&self.path);
+        if p.is_dir() {
+            p
+        } else {
+            p.parent().filter(|d| d.is_dir()).map(|d| d.to_path_buf()).unwrap_or_else(default_browse_dir)
         }
     }
 }
@@ -164,6 +304,9 @@ struct App {
     store: Store,
     registry: Registry,
     registry_path: PathBuf,
+
+    export_form: Option<PathForm>,
+    import_form: Option<PathForm>,
 }
 
 impl App {
@@ -218,6 +361,8 @@ impl App {
             store,
             registry,
             registry_path,
+            export_form: None,
+            import_form: None,
         };
 
         app.reload_repos();
@@ -496,6 +641,109 @@ impl App {
         Ok(())
     }
 
+    fn open_native_picker(&mut self) -> Result<()> {
+        let start = self.repo_form.as_ref().map(|f| f.browse_start_dir());
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = &start {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.pick_folder();
+
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        self.needs_clear = true;
+
+        if let Some(p) = picked {
+            if let Some(f) = &mut self.repo_form {
+                f.path = p.display().to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn open_export_picker(&mut self) -> Result<()> {
+        let start = self.export_form.as_ref().map(|f| f.browse_start_dir());
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let mut dialog = rfd::FileDialog::new().set_file_name("envctl-bundle.toml");
+        if let Some(dir) = &start {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.save_file();
+
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        self.needs_clear = true;
+
+        if let Some(p) = picked {
+            if let Some(f) = &mut self.export_form {
+                f.path = p.display().to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn open_import_picker(&mut self) -> Result<()> {
+        let start = self.import_form.as_ref().map(|f| f.browse_start_dir());
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = &start {
+            dialog = dialog.set_directory(dir);
+        }
+        let picked = dialog.pick_file();
+
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        self.needs_clear = true;
+
+        if let Some(p) = picked {
+            if let Some(f) = &mut self.import_form {
+                f.path = p.display().to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles keys while the export/import path-form's directory browser overlay is open.
+    fn handle_key_path_browser(&mut self, key: KeyEvent, is_export: bool) {
+        let form = if is_export { &mut self.export_form } else { &mut self.import_form };
+        let f = match form { Some(f) => f, None => return };
+        match key.code {
+            KeyCode::Esc => { f.browser = None; }
+            KeyCode::Up => { f.browser.as_mut().unwrap().move_up(); }
+            KeyCode::Down => { f.browser.as_mut().unwrap().move_down(); }
+            KeyCode::Backspace => { f.browser.as_mut().unwrap().go_up(); }
+            KeyCode::Enter => {
+                let browser = f.browser.as_mut().unwrap();
+                if let Some(file) = browser.selected_file_path() {
+                    f.path = file.display().to_string();
+                    f.browser = None;
+                } else {
+                    browser.enter_selected();
+                }
+            }
+            KeyCode::Tab => {
+                let cwd = f.browser.as_ref().unwrap().cwd.clone();
+                let name = PathBuf::from(&f.path)
+                    .file_name()
+                    .map(|n| n.to_os_string())
+                    .unwrap_or_else(|| "envctl-bundle.toml".into());
+                f.path = cwd.join(name).display().to_string();
+                f.browser = None;
+            }
+            _ => {}
+        }
+    }
+
     fn rs_mgr_add_submit(&mut self) -> Result<()> {
         let form = match self.rs_form.take() { Some(f) => f, None => return Ok(()) };
         let name = form.name.trim().to_string();
@@ -619,9 +867,144 @@ impl App {
         Ok(())
     }
 
+    fn do_export_bundle(&mut self, path: String) {
+        let pairs = match self.store.list_all() {
+            Ok(p) => p,
+            Err(e) => { self.notify(format!("✗ {e}")); return; }
+        };
+        let mut vars: IndexMap<String, IndexMap<String, String>> = IndexMap::new();
+        for (rs, repo) in pairs {
+            if let Ok(v) = self.store.load(&rs, &repo) {
+                if !v.is_empty() {
+                    vars.insert(format!("{rs}/{repo}"), v);
+                }
+            }
+        }
+        let bundle = Bundle { registry: self.registry.clone(), vars };
+        let s = match toml::to_string(&bundle) {
+            Ok(s) => s,
+            Err(e) => { self.notify(format!("✗ serialize: {e}")); return; }
+        };
+        match std::fs::write(&path, s) {
+            Ok(_) => self.notify(format!("✓ exported bundle → {path}")),
+            Err(e) => self.notify(format!("✗ {e}")),
+        }
+    }
+
+    fn do_import_bundle(&mut self, path: String) {
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => { self.notify(format!("✗ {e}")); return; }
+        };
+        let bundle: Bundle = match toml::from_str(&s) {
+            Ok(b) => b,
+            Err(e) => { self.notify(format!("✗ parse: {e}")); return; }
+        };
+
+        for (name, entry) in &bundle.registry.rs {
+            if !self.registry.rs.contains_key(name) {
+                self.registry.rs.insert(name.clone(), entry.clone());
+            } else {
+                for (repo_name, repo_path) in &entry.repos {
+                    if !self.registry.rs[name].repos.contains_key(repo_name) {
+                        self.registry.rs.get_mut(name).unwrap().repos.insert(repo_name.clone(), repo_path.clone());
+                    }
+                }
+            }
+        }
+        for (name, path_str) in &bundle.registry.repos {
+            if !self.registry.repos.contains_key(name) {
+                self.registry.repos.insert(name.clone(), path_str.clone());
+            }
+        }
+        if let Err(e) = self.registry.save(&self.registry_path) {
+            self.notify(format!("✗ save registry: {e}")); return;
+        }
+
+        let mut imported_vars = 0usize;
+        for (key, v) in &bundle.vars {
+            if let Some((rs, repo)) = key.split_once('/') {
+                let _ = self.store.save(rs, repo, v);
+                imported_vars += v.len();
+            }
+        }
+
+        self.all_rs = self.registry.rs.keys().cloned().collect();
+        self.reload_rs_list();
+        self.reload_repos();
+        self.compute_all_sync();
+        self.load_vars();
+        self.notify(format!(
+            "✓ imported {} RS, {} repos, {} vars from {}",
+            bundle.registry.rs.len(),
+            bundle.vars.len(),
+            imported_vars,
+            path
+        ));
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
+            return Ok(());
+        }
+        if self.export_form.is_some() {
+            if self.export_form.as_ref().unwrap().browser.is_some() {
+                self.handle_key_path_browser(key, true);
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Esc => { self.export_form = None; self.notify("cancelled"); }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_export_picker()?;
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(f) = &mut self.export_form {
+                        let start = f.browse_start_dir();
+                        f.browser = Some(FileBrowser::new_with(start, true));
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(f) = self.export_form.take() {
+                        let path = if f.path.is_empty() { "envctl-bundle.toml".to_string() } else { f.path };
+                        self.do_export_bundle(path);
+                    }
+                }
+                KeyCode::Backspace => { self.export_form.as_mut().unwrap().path.pop(); }
+                KeyCode::Char(c) => { self.export_form.as_mut().unwrap().path.push(c); }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.import_form.is_some() {
+            if self.import_form.as_ref().unwrap().browser.is_some() {
+                self.handle_key_path_browser(key, false);
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Esc => { self.import_form = None; self.notify("cancelled"); }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_import_picker()?;
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(f) = &mut self.import_form {
+                        let start = f.browse_start_dir();
+                        f.browser = Some(FileBrowser::new_with(start, true));
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(f) = self.import_form.take() {
+                        if f.path.is_empty() {
+                            self.notify("path required");
+                        } else {
+                            self.do_import_bundle(f.path);
+                        }
+                    }
+                }
+                KeyCode::Backspace => { self.import_form.as_mut().unwrap().path.pop(); }
+                KeyCode::Char(c) => { self.import_form.as_mut().unwrap().path.push(c); }
+                _ => {}
+            }
             return Ok(());
         }
         match self.view {
@@ -652,6 +1035,8 @@ impl App {
             KeyCode::Char('1') => self.view = View::EnvManager,
             KeyCode::Char('2') => self.view = View::RsManager,
             KeyCode::Char('3') => self.view = View::RepoManager,
+            KeyCode::Char('x') => { self.export_form = Some(PathForm::new("envctl-bundle.toml")); self.clear_status(); }
+            KeyCode::Char('i') => { self.import_form = Some(PathForm::new(String::new())); self.clear_status(); }
             _ => {}
         }
         Ok(())
@@ -895,8 +1280,52 @@ impl App {
 
     fn handle_key_repo_mgr(&mut self, key: KeyEvent) -> Result<()> {
         if self.repo_form.is_some() {
+            // browser overlay open: arrows/enter navigate dirs, tab accepts, esc closes overlay only
+            if self.repo_form.as_ref().unwrap().browser.is_some() {
+                match key.code {
+                    KeyCode::Esc => {
+                        if let Some(f) = &mut self.repo_form { f.browser = None; }
+                    }
+                    KeyCode::Up => {
+                        if let Some(f) = &mut self.repo_form { f.browser.as_mut().unwrap().move_up(); }
+                    }
+                    KeyCode::Down => {
+                        if let Some(f) = &mut self.repo_form { f.browser.as_mut().unwrap().move_down(); }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(f) = &mut self.repo_form { f.browser.as_mut().unwrap().go_up(); }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(f) = &mut self.repo_form { f.browser.as_mut().unwrap().enter_selected(); }
+                    }
+                    KeyCode::Tab => {
+                        if let Some(f) = &mut self.repo_form {
+                            let cwd = f.browser.as_ref().unwrap().cwd.display().to_string();
+                            f.path = cwd;
+                            f.browser = None;
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
             match key.code {
                 KeyCode::Esc => { self.repo_form = None; self.notify("cancelled"); }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.repo_mgr_add_submit()?;
+                }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.open_native_picker()?;
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(f) = &mut self.repo_form {
+                        if f.focus == RepoFormField::Path {
+                            let start = f.browse_start_dir();
+                            f.browser = Some(FileBrowser::new(start));
+                        }
+                    }
+                }
                 KeyCode::Enter => {
                     let advance = self.repo_form.as_ref()
                         .map(|f| f.focus == RepoFormField::Name && !f.name.is_empty())
@@ -1030,11 +1459,21 @@ fn draw_menu(f: &mut Frame, app: &mut App) {
 
     f.render_stateful_widget(list, menu_area, &mut app.menu_state);
 
-    let hint = Paragraph::new("[j/k] nav  [enter] select  [q] quit")
+    let hint = Paragraph::new("[j/k] nav  [enter] select  [x] export  [i] import  [q] quit")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
     let hint_area = Rect { x: area.x + 1, y: area.y + area.height - 2, width: inner_w, height: 1 };
     f.render_widget(hint, hint_area);
+
+    if app.export_form.is_some() {
+        draw_path_form(f, area, " Export Bundle ", "Output path:", app.export_form.as_mut().unwrap());
+    }
+    if app.import_form.is_some() {
+        draw_path_form(f, area, " Import Bundle ", "Bundle file:", app.import_form.as_mut().unwrap());
+    }
+    if !app.status.is_empty() {
+        draw_notification(f, area, &app.status.clone());
+    }
 }
 
 fn draw_env_manager(f: &mut Frame, app: &mut App) {
@@ -1365,6 +1804,63 @@ fn draw_var_form(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_path_form(f: &mut Frame, area: Rect, title: &str, label: &str, form: &mut PathForm) {
+    let browsing = form.browser.is_some();
+    let w: u16 = 64;
+    let h: u16 = if browsing { 20 } else { 5 };
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let path_line = Line::from(vec![
+        Span::styled(format!("{label} "), Style::default().fg(Color::Yellow)),
+        Span::styled(form.path.clone(), Style::default().fg(Color::White)),
+        Span::styled(if browsing { "" } else { "█" }, Style::default().fg(Color::Yellow)),
+    ]);
+
+    if browsing {
+        let cwd_line = Line::from(Span::styled(
+            form.browser.as_ref().unwrap().cwd.display().to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        let chunks = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        f.render_widget(Paragraph::new(path_line), chunks[0]);
+        f.render_widget(Paragraph::new(cwd_line), chunks[1]);
+
+        let browser = form.browser.as_mut().unwrap();
+        let labels: Vec<String> = browser.entries.iter()
+            .map(|e| {
+                if e.is_parent { "../".to_string() }
+                else if e.is_dir { format!("{}/", e.name) }
+                else { e.name.clone() }
+            })
+            .collect();
+        let items: Vec<ListItem> = labels.into_iter().map(ListItem::new).collect();
+        let list = List::new(items)
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
+        f.render_stateful_widget(list, chunks[2], &mut browser.state);
+    } else {
+        let hint = Line::from(Span::styled(
+            "  [enter] confirm  [ctrl+b] browse  [ctrl+o] os explorer  [esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(vec![path_line, hint]), inner);
+    }
+}
+
 fn draw_diff(f: &mut Frame, area: Rect, rs: &str, repo: &str, lines: &[(ChangeTag, String)]) {
     let block = Block::default()
         .title(format!(" DIFF — {rs}/{repo} (disk → store) "))
@@ -1425,8 +1921,10 @@ fn draw_repo_manager(f: &mut Frame, app: &mut App) {
 
     f.render_stateful_widget(list, vert[0], &mut app.repo_mgr_state);
 
-    let hint = if app.repo_form.is_some() {
-        " [tab] next field  [enter] confirm  [esc] cancel"
+    let hint = if app.repo_form.as_ref().map(|f| f.browser.is_some()).unwrap_or(false) {
+        " [↑↓] nav  [enter] open dir  [bksp] up  [tab] pick this dir  [esc] close"
+    } else if app.repo_form.is_some() {
+        " [tab] field  [ctrl+b] browse  [ctrl+o] os explorer  [ctrl+s] save  [esc] cancel"
     } else {
         " [j/k] nav  [a]dd  [e]dit  [d]elete  [esc/q] menu"
     };
@@ -1445,18 +1943,25 @@ fn draw_repo_manager(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_repo_form(f: &mut Frame, area: Rect, app: &App) {
-    let form = app.repo_form.as_ref().unwrap();
+fn draw_repo_form(f: &mut Frame, area: Rect, app: &mut App) {
+    let browsing = app.repo_form.as_ref().unwrap().browser.is_some();
+    let path_focused = app.repo_form.as_ref().unwrap().focus == RepoFormField::Path;
+    let name_focused = !path_focused;
+    let editing = app.repo_form.as_ref().unwrap().editing.is_some();
+    let name = app.repo_form.as_ref().unwrap().name.clone();
+    let path = app.repo_form.as_ref().unwrap().path.clone();
 
-    let w: u16 = 60;
-    let h: u16 = 7;
+    let w: u16 = 70;
+    let h: u16 = if browsing { 20 } else { 7 };
+    let w = w.min(area.width);
+    let h = h.min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let popup = Rect { x, y, width: w, height: h };
 
     f.render_widget(Clear, popup);
 
-    let title = if form.editing.is_some() { " Edit Repo " } else { " Add Repo " };
+    let title = if editing { " Edit Repo " } else { " Add Repo " };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -1464,30 +1969,47 @@ fn draw_repo_form(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let name_focused = form.focus == RepoFormField::Name;
-    let path_focused = form.focus == RepoFormField::Path;
-
     let name_style = if name_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
     let path_style = if path_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-
     let name_cursor = if name_focused { "█" } else { "" };
-    let path_cursor = if path_focused { "█" } else { "" };
+    let path_cursor = if path_focused && !browsing { "█" } else { "" };
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Name: ", name_style),
-            Span::styled(&form.name, Style::default().fg(Color::White)),
-            Span::styled(name_cursor, Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Path: ", path_style),
-            Span::styled(&form.path, Style::default().fg(Color::White)),
-            Span::styled(path_cursor, Style::default().fg(Color::Yellow)),
-        ]),
-    ];
+    let name_line = Line::from(vec![
+        Span::styled("Name: ", name_style),
+        Span::styled(name, Style::default().fg(Color::White)),
+        Span::styled(name_cursor, Style::default().fg(Color::Yellow)),
+    ]);
+    let path_line = Line::from(vec![
+        Span::styled("Path: ", path_style),
+        Span::styled(path, Style::default().fg(Color::White)),
+        Span::styled(path_cursor, Style::default().fg(Color::Yellow)),
+    ]);
 
-    f.render_widget(Paragraph::new(lines), inner);
+    if browsing {
+        let cwd_line = Line::from(Span::styled(
+            app.repo_form.as_ref().unwrap().browser.as_ref().unwrap().cwd.display().to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+        let chunks = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        f.render_widget(Paragraph::new(name_line), chunks[0]);
+        f.render_widget(Paragraph::new(cwd_line), chunks[1]);
+
+        let labels: Vec<String> = app.repo_form.as_ref().unwrap().browser.as_ref().unwrap().entries.iter()
+            .map(|e| if e.is_parent { "../".to_string() } else { format!("{}/", e.name) })
+            .collect();
+        let items: Vec<ListItem> = labels.into_iter().map(ListItem::new).collect();
+        let list = List::new(items)
+            .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
+        let form = app.repo_form.as_mut().unwrap();
+        f.render_stateful_widget(list, chunks[2], &mut form.browser.as_mut().unwrap().state);
+    } else {
+        let lines = vec![name_line, Line::from(""), path_line];
+        f.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 pub fn run(store: Store, registry: Registry, registry_path: PathBuf) -> Result<()> {
@@ -1513,7 +2035,9 @@ pub fn run(store: Store, registry: Registry, registry_path: PathBuf) -> Result<(
             terminal.draw(|f| draw(f, &mut app))?;
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    app.handle_key(key)?;
+                    if key.kind == KeyEventKind::Press {
+                        app.handle_key(key)?;
+                    }
                 }
             }
             if app.quit { break; }

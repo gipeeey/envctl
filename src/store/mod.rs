@@ -64,4 +64,27 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Scan store dir and return all (rs, repo) pairs that have store files.
+    pub fn list_all(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        if !self.repos_dir.exists() {
+            return Ok(out);
+        }
+        for rs_entry in std::fs::read_dir(&self.repos_dir)? {
+            let rs_entry = rs_entry?;
+            if !rs_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let rs_name = rs_entry.file_name().to_string_lossy().into_owned();
+            for repo_entry in std::fs::read_dir(rs_entry.path())? {
+                let repo_entry = repo_entry?;
+                let fname = repo_entry.file_name().to_string_lossy().into_owned();
+                if let Some(repo_name) = fname.strip_suffix(".toml.age") {
+                    out.push((rs_name.clone(), repo_name.to_string()));
+                }
+            }
+        }
+        Ok(out)
+    }
 }

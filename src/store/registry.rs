@@ -10,7 +10,7 @@ pub struct RsEntry {
     pub repos: IndexMap<String, String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Registry {
     #[serde(default)]
     pub repos: IndexMap<String, String>,

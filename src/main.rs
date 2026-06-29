@@ -539,12 +539,10 @@ fn cmd_export_bundle(config: &Path, output: Option<&str>) -> Result<()> {
     let store = load_store(config)?;
     let mut vars: IndexMap<String, IndexMap<String, String>> = IndexMap::new();
 
-    for (rs_name, entry) in &registry.rs {
-        for repo_name in entry.repos.keys() {
-            let v = store.load(rs_name, repo_name)?;
-            if !v.is_empty() {
-                vars.insert(format!("{rs_name}/{repo_name}"), v);
-            }
+    for (rs_name, repo_name) in store.list_all()? {
+        let v = store.load(&rs_name, &repo_name)?;
+        if !v.is_empty() {
+            vars.insert(format!("{rs_name}/{repo_name}"), v);
         }
     }
 

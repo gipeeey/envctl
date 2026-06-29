@@ -16,3 +16,4 @@ tempfile = "3"
 indexmap = { version = "2", features = ["serde"] }
 ratatui = "0.29"
 crossterm = "0.28"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
